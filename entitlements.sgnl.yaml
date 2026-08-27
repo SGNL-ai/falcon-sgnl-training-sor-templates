@@ -12,7 +12,7 @@ defaultApiCallFrequency: SECONDLY
 defaultApiCallMinInterval: 1
 type: "S3-1.0.0"
 # Configure with S3 bucket containing entitlement CSV files
-adapterConfig: "ewogICJyZWdpb24iOiAidXMtZWFzdC0yIiwKICAiYnVja2V0IjogInNnbmwtdHJhaW5pbmctc29yLWluZ2VzdCIKfQo="
+adapterConfig: "ewogICJyZWdpb24iOiAidXMtZWFzdC0yIiwKICAiYnVja2V0IjogInNnbmwtdHJhaW5pbmctc29yLWluZ2VzdCIKICAicHJlZml4IjogImVudGl0bGVtZW50cyIKfQo="
 auth:
   - basic:
       username: "{{Input Required: Username}}"

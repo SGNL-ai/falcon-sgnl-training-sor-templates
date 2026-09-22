@@ -1,0 +1,225 @@
+name: PR Notifications
+
+on:
+  pull_request:
+    types: [opened]
+    branches: [main]
+
+jobs:
+  notify:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Get PR changes from GitHub API
+        id: changelog
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Fetch commits in this PR
+          COMMITS=$(gh api "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/commits" \
+            --jq '.[] | "• \(.commit.message | split("\n") | .[0]) (\(.commit.author.name))"')
+
+          # Fetch changed files with stats
+          FILES=$(gh api "/repos/${{ github.repository }}/pulls/${{ github.event.pull_request.number }}/files" \
+            --jq '.[] | "\(.status)\t+\(.additions) -\(.deletions)\t\(.filename)"')
+
+          echo "commits<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$COMMITS" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+          echo "files<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$FILES" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Notify Slack
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          COMMITS: ${{ steps.changelog.outputs.commits }}
+          FILES: ${{ steps.changelog.outputs.files }}
+        run: |
+          # Build the payload using jq to handle special characters safely
+          PAYLOAD=$(jq -n \
+            --arg title "📋 New Pull Request - falcon-sgnl-training-sor-templates" \
+            --arg pr_info "*PR:* <${PR_URL}|#${PR_NUMBER} - ${PR_TITLE}>" \
+            --arg author "$PR_AUTHOR" \
+            --arg branch "${HEAD_BRANCH} → main" \
+            --arg commits "$COMMITS" \
+            --arg files "$FILES" \
+            --arg pr_url "$PR_URL" \
+            '{
+              "text": "New PR opened in falcon-sgnl-training-sor-templates",
+              "blocks": [
+                {
+                  "type": "header",
+                  "text": { "type": "plain_text", "text": $title }
+                },
+                {
+                  "type": "section",
+                  "fields": [
+                    { "type": "mrkdwn", "text": ("*Author:*\n" + $author) },
+                    { "type": "mrkdwn", "text": ("*Branch:*\n" + $branch) }
+                  ]
+                },
+                {
+                  "type": "section",
+                  "text": { "type": "mrkdwn", "text": $pr_info }
+                },
+                {
+                  "type": "section",
+                  "text": { "type": "mrkdwn", "text": ("*Commits:*\n" + $commits) }
+                },
+                {
+                  "type": "section",
+                  "text": { "type": "mrkdwn", "text": ("*Changed files:*\n```" + $files + "```") }
+                },
+                {
+                  "type": "actions",
+                  "elements": [
+                    {
+                      "type": "button",
+                      "text": { "type": "plain_text", "text": "Review PR" },
+                      "url": $pr_url
+                    }
+                  ]
+                }
+              ]
+            }')
+
+          curl -s -X POST "$SLACK_WEBHOOK_URL" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD"
+
+      - name: Authenticate to Salesforce
+        id: sf_auth
+        env:
+          SF_LOGIN_URL: ${{ secrets.SF_LOGIN_URL }}
+          SF_CLIENT_ID: ${{ secrets.SF_CLIENT_ID }}
+          SF_CLIENT_SECRET: ${{ secrets.SF_CLIENT_SECRET }}
+        run: |
+          RESPONSE=$(curl -s -X POST "${SF_LOGIN_URL}/services/oauth2/token" \
+            -d "grant_type=client_credentials" \
+            -d "client_id=${SF_CLIENT_ID}" \
+            -d "client_secret=${SF_CLIENT_SECRET}")
+
+          ACCESS_TOKEN=$(echo "$RESPONSE" | jq -r '.access_token')
+          INSTANCE_URL=$(echo "$RESPONSE" | jq -r '.instance_url')
+
+          if [ "$ACCESS_TOKEN" = "null" ] || [ -z "$ACCESS_TOKEN" ]; then
+            echo "::error::Salesforce authentication failed"
+            echo "$RESPONSE" | jq .
+            exit 1
+          fi
+
+          echo "::add-mask::$ACCESS_TOKEN"
+          echo "access_token=$ACCESS_TOKEN" >> "$GITHUB_OUTPUT"
+          echo "instance_url=$INSTANCE_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Create Salesforce Knowledge article
+        env:
+          SF_TOKEN: ${{ steps.sf_auth.outputs.access_token }}
+          SF_URL: ${{ steps.sf_auth.outputs.instance_url }}
+          PR_TITLE: ${{ github.event.pull_request.title }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+          HEAD_BRANCH: ${{ github.head_ref }}
+          COMMITS: ${{ steps.changelog.outputs.commits }}
+          FILES: ${{ steps.changelog.outputs.files }}
+        run: |
+          DEPLOY_DATE=$(date -u +"%Y-%m-%d %H:%M UTC")
+
+          # Build the article body as HTML
+          ARTICLE_BODY=$(cat <<HTMLEOF
+          <h2>Pull Request Details</h2>
+          <p><strong>PR:</strong> <a href="${PR_URL}">#${PR_NUMBER} - ${PR_TITLE}</a></p>
+          <p><strong>Date:</strong> ${DEPLOY_DATE}</p>
+          <p><strong>Author:</strong> ${PR_AUTHOR}</p>
+          <p><strong>Branch:</strong> ${HEAD_BRANCH} → main</p>
+          <h3>Commits</h3>
+          <pre>${COMMITS}</pre>
+          <h3>Changed Files</h3>
+          <pre>${FILES}</pre>
+          HTMLEOF
+          )
+
+          # Use jq to safely build JSON with special characters
+          PAYLOAD=$(jq -n \
+            --arg title "falcon-sgnl-training-sor-templates PR #${PR_NUMBER} - ${DEPLOY_DATE}" \
+            --arg url_name "training-sor-templates-pr-${PR_NUMBER}-$(date -u +%Y%m%d-%H%M%S)" \
+            --arg summary "PR #${PR_NUMBER}: ${PR_TITLE} by ${PR_AUTHOR}" \
+            --arg body "$ARTICLE_BODY" \
+            '{
+              "Title": $title,
+              "UrlName": $url_name,
+              "Summary": $summary,
+              "Body__c": $body
+            }')
+
+          # Create Knowledge article (draft)
+          # Update the object name (Knowledge__kav) if your org uses a custom article type
+          RESPONSE=$(curl -s -w "\n%{http_code}" -X POST "${SF_URL}/services/data/v62.0/sobjects/Knowledge__kav" \
+            -H "Authorization: Bearer ${SF_TOKEN}" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD")
+
+          HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+          BODY=$(echo "$RESPONSE" | sed '$d')
+
+          if [ "$HTTP_CODE" -ge 200 ] && [ "$HTTP_CODE" -lt 300 ]; then
+            echo "Knowledge article created successfully"
+            echo "$BODY" | jq .
+          else
+            echo "::error::Failed to create Knowledge article (HTTP ${HTTP_CODE})"
+            echo "$BODY" | jq .
+            exit 1
+          fi
+
+      # TODO: Replace SMTP with Gmail API + service account (domain-wide delegation)
+      # - name: Send email notification
+      #   env:
+      #     EMAIL_USERNAME: ${{ secrets.EMAIL_USERNAME }}
+      #     EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+      #     PR_TITLE: ${{ github.event.pull_request.title }}
+      #     PR_URL: ${{ github.event.pull_request.html_url }}
+      #     PR_NUMBER: ${{ github.event.pull_request.number }}
+      #     PR_AUTHOR: ${{ github.event.pull_request.user.login }}
+      #     HEAD_BRANCH: ${{ github.head_ref }}
+      #     COMMITS: ${{ steps.changelog.outputs.commits }}
+      #     FILES: ${{ steps.changelog.outputs.files }}
+      #   run: |
+      #     SUBJECT="📋 New PR #${PR_NUMBER} - ${PR_TITLE}"
+      #
+      #     BODY=$(cat <<HTMLEOF
+      #     <h2>New Pull Request - falcon-sgnl-training-sor-templates</h2>
+      #     <p><strong>PR:</strong> <a href="${PR_URL}">#${PR_NUMBER} - ${PR_TITLE}</a></p>
+      #     <p><strong>Author:</strong> ${PR_AUTHOR}</p>
+      #     <p><strong>Branch:</strong> ${HEAD_BRANCH} → main</p>
+      #     <h3>Commits:</h3>
+      #     <pre>${COMMITS}</pre>
+      #     <h3>Changed files:</h3>
+      #     <pre>${FILES}</pre>
+      #     <p><a href="${PR_URL}">Review PR</a></p>
+      #     HTMLEOF
+      #     )
+      #
+      #     # Send via SMTP using curl
+      #     cat > /tmp/email.txt <<EMAILEOF
+      #     From: Deploy Bot <${EMAIL_USERNAME}>
+      #     To: joe.welsh@crowdstrike.com
+      #     Subject: ${SUBJECT}
+      #     MIME-Version: 1.0
+      #     Content-Type: text/html; charset="UTF-8"
+      #
+      #     ${BODY}
+      #     EMAILEOF
+      #
+      #     curl -s --ssl-reqd \
+      #       --url "smtps://smtp.gmail.com:465" \
+      #       --user "${EMAIL_USERNAME}:${EMAIL_PASSWORD}" \
+      #       --mail-from "${EMAIL_USERNAME}" \
+      #       --mail-rcpt "joe.welsh@crowdstrike.com" \
+      #       --upload-file /tmp/email.txt
